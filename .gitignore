@@ -1,0 +1,4 @@
+﻿venv
+utils/__pycache__
+calculator.py
+output.csv
