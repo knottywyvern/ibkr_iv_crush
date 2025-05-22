@@ -21,6 +21,9 @@ import os
 import yfinance as yf
 from curl_cffi import requests as curl_requests
 import utils.styles as styles
+import logging
+import sys
+import platform
 
 # Create a session for yfinance to use
 session = curl_requests.Session(impersonate="chrome")
@@ -31,19 +34,79 @@ nest_asyncio.apply()
 # Apply the Bloomberg-like theme
 styles.setup_bloomberg_theme()
 
+# Setup logging
+log_dir = "logs"
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir)
+
+log_file = os.path.join(log_dir, f"ib_calculator_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+logger = logging.getLogger("ib_calculator")
+logger.setLevel(logging.INFO)  # Default to INFO level
+
+# File handler for all logs
+file_handler = logging.FileHandler(log_file)
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+logger.addHandler(file_handler)
+
+# Console handler for debug level or higher
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+console_handler.setLevel(logging.WARNING)  # By default only show warnings and above
+logger.addHandler(console_handler)
+
+# Enable debug logging
+def set_debug_mode(enable=True):
+    logger.setLevel(logging.DEBUG if enable else logging.INFO)
+    if enable:
+        logger.debug("Debug logging enabled")
+
 # Connect to Interactive Brokers TWS/Gateway
 async def connect_to_ib(host='127.0.0.1', port=7497, client_id=1):
     """Connect to Interactive Brokers TWS or Gateway"""
     ib = IB()
     try:
+        logger.info(f"Connecting to IB at {host}:{port} with client ID {client_id}")
+        logger.debug(f"System info: {platform.system()} {platform.release()}")
+        
+        # Mac-specific connection check - test if port is accessible first
+        if platform.system() == "Darwin":  # macOS
+            logger.debug("Detected macOS - testing port access before connection")
+            import socket
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(3)  # 3 second timeout
+            try:
+                s.connect((host, port))
+                logger.debug(f"Port {port} is open and accessible")
+                s.close()
+            except (socket.timeout, ConnectionRefusedError) as e:
+                s.close()
+                logger.error(f"Port {port} is not accessible: {str(e)}")
+                logger.error("On macOS, check TWS/Gateway is running and the port is enabled in the settings.")
+                logger.error("In TWS: Configure > API > Settings > Enable ActiveX and Socket Clients")
+                raise ConnectionError(f"Port {port} is not accessible. Check TWS/Gateway is running and API connections are enabled")
+        
         # Set timeout for IB operations
         ib.RequestTimeout = 10  # 10 second timeout for all requests
+        logger.debug("Set request timeout to 10 seconds")
+        
+        # Log more detailed connection attempt
+        logger.debug(f"Attempting connectAsync({host}, {port}, clientId={client_id})")
         await ib.connectAsync(host, port, clientId=client_id)
+        
         # Ensure we're using the IB event loop for all operations
         await asyncio.sleep(0.1)  # Small sleep to initialize connection properly
-        return ib
+        
+        if ib.isConnected():
+            logger.info("Successfully connected to IB")
+            return ib
+        else:
+            logger.error("IB connection failed - not connected after attempt")
+            return None
     except Exception as e:
-        raise ConnectionError(f"Failed to connect to IB: {str(e)}")
+        error_msg = f"Failed to connect to IB: {str(e)}"
+        logger.error(error_msg)
+        logger.exception("Detailed connection error:")
+        raise ConnectionError(error_msg)
 
 def filter_dates(dates):
     """Filter option expiration dates to those 45+ days out.
@@ -278,8 +341,34 @@ async def get_options_chain(ib, symbol, expiry_date, underlying_price):
         if not strikes or not exchange:
             raise ValueError(f"No suitable strikes found for {symbol} with expiry {expiry_date}")
         
-        # Find the ATM strike
-        atm_strike = min(strikes, key=lambda x: abs(x - underlying_price))
+        # Determine the strike increment by looking at the spacing between strikes
+        if len(strikes) >= 2:
+            # Sort strikes and calculate the differences
+            sorted_strikes = sorted(strikes)
+            diffs = [sorted_strikes[i+1] - sorted_strikes[i] for i in range(len(sorted_strikes)-1)]
+            
+            # Find the most common difference (this is the likely increment)
+            from collections import Counter
+            if diffs:
+                common_diffs = Counter(diffs).most_common()
+                strike_increment = common_diffs[0][0]
+            else:
+                strike_increment = 1.0  # Default to 1.0 if can't determine
+                
+            # Round the underlying price to the nearest valid strike increment
+            rounded_price = round(underlying_price / strike_increment) * strike_increment
+            
+            # Find the closest valid strike to the rounded price
+            valid_strikes = [s for s in strikes if abs(s % strike_increment) < 0.01 or abs(s % strike_increment - strike_increment) < 0.01]
+            
+            # If no valid strikes found, use all strikes
+            if not valid_strikes:
+                valid_strikes = strikes
+                
+            atm_strike = min(valid_strikes, key=lambda x: abs(x - rounded_price))
+        else:
+            # If only one strike is available, use it
+            atm_strike = strikes[0]
         
         # Create call and put option contracts
         call = Option(symbol, expiry_date, atm_strike, 'C', exchange)
@@ -289,12 +378,56 @@ async def get_options_chain(ib, symbol, expiry_date, underlying_price):
         try:
             await ib.qualifyContractsAsync(call)
         except Exception as e:
-            raise ValueError(f"Failed to qualify call option: {str(e)}")
+            # If we get an error, try another strike from the list
+            if len(strikes) > 1:
+                # Sort strikes by distance from the underlying price
+                sorted_valid_strikes = sorted(valid_strikes if 'valid_strikes' in locals() else strikes, 
+                                             key=lambda x: abs(x - underlying_price))
+                
+                # Try different strikes until we find one that works
+                for backup_strike in sorted_valid_strikes[1:]:
+                    try:
+                        call = Option(symbol, expiry_date, backup_strike, 'C', exchange)
+                        await ib.qualifyContractsAsync(call)
+                        atm_strike = backup_strike  # Update the strike since this one works
+                        break
+                    except:
+                        continue
+                else:
+                    # If all attempts with valid strikes fail, try only whole number strikes
+                    whole_strikes = [s for s in strikes if s.is_integer()]
+                    if whole_strikes:
+                        closest_whole = min(whole_strikes, key=lambda x: abs(x - underlying_price))
+                        try:
+                            call = Option(symbol, expiry_date, closest_whole, 'C', exchange)
+                            await ib.qualifyContractsAsync(call)
+                            atm_strike = closest_whole
+                        except:
+                            raise ValueError(f"Failed to qualify call option after multiple attempts: {str(e)}")
+                    else:
+                        raise ValueError(f"Failed to qualify call option after multiple attempts: {str(e)}")
+            else:
+                raise ValueError(f"Failed to qualify call option: {str(e)}")
             
         try:
+            # Update put strike to match the call strike that worked
+            put = Option(symbol, expiry_date, atm_strike, 'P', exchange)
             await ib.qualifyContractsAsync(put)
         except Exception as e:
-            raise ValueError(f"Failed to qualify put option: {str(e)}")
+            # If put fails, try whole number strikes as a last resort
+            whole_strikes = [s for s in strikes if s.is_integer()]
+            if whole_strikes:
+                closest_whole = min(whole_strikes, key=lambda x: abs(x - underlying_price))
+                try:
+                    put = Option(symbol, expiry_date, closest_whole, 'P', exchange)
+                    await ib.qualifyContractsAsync(put)
+                    atm_strike = closest_whole  # Also update the call with this working strike
+                    call = Option(symbol, expiry_date, atm_strike, 'C', exchange)
+                    await ib.qualifyContractsAsync(call)
+                except:
+                    raise ValueError(f"Failed to qualify put option: {str(e)}")
+            else:
+                raise ValueError(f"Failed to qualify put option: {str(e)}")
         
         # Request option prices using reqMktData
         call_ticker = ib.reqMktData(call, '106', False, False)  # '106' includes implied volatility
@@ -312,25 +445,63 @@ async def get_options_chain(ib, symbol, expiry_date, underlying_price):
             call_price = (call_ticker.bid + call_ticker.ask) / 2
         elif not math.isnan(call_ticker.last):
             call_price = call_ticker.last
+        else:
+            print(f"Warning: No valid price data for {symbol} call option, strike {atm_strike}, expiry {expiry_date}")
             
         if not math.isnan(put_ticker.bid) and not math.isnan(put_ticker.ask):
             put_price = (put_ticker.bid + put_ticker.ask) / 2
         elif not math.isnan(put_ticker.last):
             put_price = put_ticker.last
+        else:
+            print(f"Warning: No valid price data for {symbol} put option, strike {atm_strike}, expiry {expiry_date}")
         
         # Calculate IV from straddle price
         call_iv = None
         put_iv = None
+        call_vega = None
+        put_vega = None
         
         # First try to get IV directly from the IB data if available
         try:
-            if hasattr(call_ticker, 'modelGreeks') and call_ticker.modelGreeks and hasattr(call_ticker.modelGreeks, 'implVol'):
-                call_iv = call_ticker.modelGreeks.implVol
+            # Get modelGreeks data
+            if hasattr(call_ticker, 'modelGreeks') and call_ticker.modelGreeks:
+                if hasattr(call_ticker.modelGreeks, 'implVol'):
+                    call_iv = call_ticker.modelGreeks.implVol
+                if hasattr(call_ticker.modelGreeks, 'vega'):
+                    call_vega = call_ticker.modelGreeks.vega
+                    # Convert to a more meaningful value (as IB returns a small decimal)
+                    if call_vega is not None:
+                        call_vega = call_vega * 100  # Convert to vega per 1% change in IV
             
-            if hasattr(put_ticker, 'modelGreeks') and put_ticker.modelGreeks and hasattr(put_ticker.modelGreeks, 'implVol'):
-                put_iv = put_ticker.modelGreeks.implVol
-        except Exception:
-            pass
+            if hasattr(put_ticker, 'modelGreeks') and put_ticker.modelGreeks:
+                if hasattr(put_ticker.modelGreeks, 'implVol'):
+                    put_iv = put_ticker.modelGreeks.implVol
+                if hasattr(put_ticker.modelGreeks, 'vega'):
+                    put_vega = put_ticker.modelGreeks.vega
+                    # Convert to a more meaningful value (as IB returns a small decimal)
+                    if put_vega is not None:
+                        put_vega = put_vega * 100  # Convert to vega per 1% change in IV
+                        
+            # If we couldn't get vega from modelGreeks, calculate it manually
+            if call_vega is None or put_vega is None:
+                # Calculate days to expiration
+                exp_date_obj = datetime.strptime(expiry_date, "%Y%m%d").date()
+                days_to_expiry = (exp_date_obj - datetime.today().date()).days
+                years_to_expiry = days_to_expiry / 365.0
+                
+                # Get ATM IV
+                atm_iv = (call_iv + put_iv) / 2.0 if call_iv is not None and put_iv is not None else 0.3  # Default to 30% if IV not available
+                
+                # Approximate vega using Black-Scholes formula for ATM options
+                # Vega ≈ S * sqrt(T) * phi(0) / 100
+                # where phi(0) is the standard normal PDF at 0, which is approximately 0.4
+                if call_vega is None and years_to_expiry > 0:
+                    call_vega = underlying_price * math.sqrt(years_to_expiry) * 0.4 * atm_iv
+                
+                if put_vega is None and years_to_expiry > 0:
+                    put_vega = underlying_price * math.sqrt(years_to_expiry) * 0.4 * atm_iv
+        except Exception as e:
+            print(f"Error calculating Greeks: {str(e)}")
         
         # If direct IV isn't available, calculate from straddle price
         if (call_iv is None or put_iv is None) and call_price is not None and put_price is not None:
@@ -362,7 +533,8 @@ async def get_options_chain(ib, symbol, expiry_date, underlying_price):
             'strike': atm_strike,
             'bid': call_ticker.bid if not math.isnan(call_ticker.bid) else None,
             'ask': call_ticker.ask if not math.isnan(call_ticker.ask) else None,
-            'impliedVolatility': call_iv
+            'impliedVolatility': call_iv,
+            'vega': call_vega
         }
         
         # Create put dataframe
@@ -370,7 +542,8 @@ async def get_options_chain(ib, symbol, expiry_date, underlying_price):
             'strike': atm_strike,
             'bid': put_ticker.bid if not math.isnan(put_ticker.bid) else None,
             'ask': put_ticker.ask if not math.isnan(put_ticker.ask) else None,
-            'impliedVolatility': put_iv
+            'impliedVolatility': put_iv,
+            'vega': put_vega
         }
         
         # Cancel market data to avoid hitting limits
@@ -496,8 +669,14 @@ class AsyncApp:
         asyncio.set_event_loop(self.event_loop)
     
     async def init_connection(self, host, port, client_id):
+        logger.info(f"Initializing connection to {host}:{port}")
         self.ib = await connect_to_ib(host, port, client_id)
-        return self.ib is not None and self.ib.isConnected()
+        connected = self.ib is not None and self.ib.isConnected()
+        if connected:
+            logger.info("Connection successful")
+        else:
+            logger.error("Connection initialization failed")
+        return connected
     
     async def fetch_option_data_for_date(self, symbol, exp_date, underlying_price, status_callback=None):
         """Helper method to fetch option data for a single expiration date"""
@@ -508,13 +687,27 @@ class AsyncApp:
             calls, puts = await get_options_chain(self.ib, symbol, exp_date, underlying_price)
             
             if calls.empty or puts.empty:
-                return (exp_date, None, None, None)
+                return (exp_date, None, None, None, None)
             
             call_iv = calls.loc[0, 'impliedVolatility']
             put_iv = puts.loc[0, 'impliedVolatility']
             
+            # Get vega values
+            call_vega = calls.loc[0, 'vega']
+            put_vega = puts.loc[0, 'vega']
+            
+            # Calculate average straddle vega
+            straddle_vega = None
+            # If either call or put vega is available, use it (or average if both available)
+            if call_vega is not None and put_vega is not None:
+                straddle_vega = (call_vega + put_vega) / 2.0
+            elif call_vega is not None:
+                straddle_vega = call_vega
+            elif put_vega is not None:
+                straddle_vega = put_vega
+            
             if call_iv is None or put_iv is None:
-                return (exp_date, None, None, None)
+                return (exp_date, None, None, None, straddle_vega)
             
             atm_iv_value = (call_iv + put_iv) / 2.0
             
@@ -536,17 +729,31 @@ class AsyncApp:
             straddle = None
             if call_mid is not None and put_mid is not None:
                 straddle = (call_mid + put_mid)
+            # Fallback: If we can't get straddle from bid/ask but we have IV, estimate the straddle price
+            elif atm_iv_value is not None:
+                # Parse expiration date to calculate days to expiry
+                exp_date_obj = datetime.strptime(exp_date, "%Y%m%d").date()
+                days_to_expiry = (exp_date_obj - datetime.today().date()).days
+                years_to_expiry = days_to_expiry / 365.0
+                
+                # Approximate ATM straddle price using IV and time to expiry
+                # Formula: Stock Price * IV * sqrt(time to expiry)
+                if years_to_expiry > 0:
+                    straddle = underlying_price * atm_iv_value * math.sqrt(years_to_expiry)
             
-            return (exp_date, atm_iv_value, straddle, True)
+            return (exp_date, atm_iv_value, straddle, True, straddle_vega)
             
         except Exception as e:
             print(f"Error processing expiry {exp_date}: {str(e)}")
-            return (exp_date, None, None, None)
+            return (exp_date, None, None, None, None)
 
     async def analyze_stock(self, symbol, status_callback=None, progress_callback=None):
         """Analyze a stock with progress updates"""
         if not self.ib or not self.ib.isConnected():
-            return {'error': 'Not connected to IB'}
+            return {
+                'error': 'Not connected to IB',
+                'avg_vega': None
+            }
         
         result = {}
         
@@ -563,11 +770,17 @@ class AsyncApp:
                     status_callback("Requesting option chain data from IB...")
                 exp_dates = await get_option_expiration_dates(self.ib, symbol)
                 if not exp_dates:
-                    return {'error': "No options found for this stock"}
+                    return {
+                        'error': "No options found for this stock",
+                        'avg_vega': None
+                    }
                 if status_callback:
                     status_callback(f"Found {len(exp_dates)} option expiration dates within 45 DTE")
             except Exception as e:
-                return {'error': f"No options found: {str(e)}"}
+                return {
+                    'error': f"No options found: {str(e)}",
+                    'avg_vega': None
+                }
             
             # Update progress to 20%
             if progress_callback:
@@ -580,13 +793,19 @@ class AsyncApp:
             try:
                 # Check if we have at least one date
                 if not exp_dates:
-                    return {'error': "No suitable expiration dates found"}
+                    return {
+                        'error': "No suitable expiration dates found",
+                        'avg_vega': None
+                    }
                 
                 # Sort dates for consistency
                 exp_dates = sorted(exp_dates)
                 
             except Exception as e:
-                return {'error': f"Error processing expiration dates: {str(e)}"}
+                return {
+                    'error': f"Error processing expiration dates: {str(e)}",
+                    'avg_vega': None
+                }
             
             # Update progress to 30%
             if progress_callback:
@@ -598,9 +817,15 @@ class AsyncApp:
             try:
                 underlying_price = await get_current_price(self.ib, symbol)
                 if underlying_price is None:
-                    return {'error': "No market price found"}
+                    return {
+                        'error': "No market price found",
+                        'avg_vega': None
+                    }
             except Exception as e:
-                return {'error': f"Unable to retrieve stock price: {str(e)}"}
+                return {
+                    'error': f"Unable to retrieve stock price: {str(e)}",
+                    'avg_vega': None
+                }
             
             # Update progress to 40%
             if progress_callback:
@@ -612,6 +837,7 @@ class AsyncApp:
             max_date_concurrency = 3  # Maximum number of dates to process concurrently
             atm_iv = {}
             straddle = None
+            straddle_vega = None
             
             # Process in batches to control concurrency
             for i in range(0, len(exp_dates), max_date_concurrency):
@@ -626,12 +852,15 @@ class AsyncApp:
                 batch_results = await asyncio.gather(*tasks)
                 
                 # Process results
-                for exp_date, atm_iv_value, exp_straddle, success in batch_results:
+                for exp_date, atm_iv_value, exp_straddle, success, exp_vega in batch_results:
                     if success and atm_iv_value is not None:
                         atm_iv[exp_date] = atm_iv_value
-                        # Use straddle from first expiration only
-                        if exp_date == exp_dates[0] and exp_straddle is not None:
-                            straddle = exp_straddle
+                        # Use straddle and vega from first expiration only
+                        if exp_date == exp_dates[0]:
+                            if exp_straddle is not None:
+                                straddle = exp_straddle
+                            if exp_vega is not None:
+                                straddle_vega = exp_vega
                 
                 # Update progress incrementally
                 if progress_callback:
@@ -639,7 +868,10 @@ class AsyncApp:
                     progress_callback(min(70, current_progress))  # Cap at 70%
             
             if not atm_iv:
-                return {'error': "Could not determine ATM IV for any expiration dates"}
+                return {
+                    'error': "Could not determine ATM IV for any expiration dates",
+                    'avg_vega': None
+                }
             
             # Update progress to 70%
             if progress_callback:
@@ -690,6 +922,15 @@ class AsyncApp:
             iv30_rv30_ratio = iv30 / rv30 if rv30 > 0 else 0
             expected_move = str(round(straddle / underlying_price * 100, 2)) + "%" if straddle else None
             
+            # Fallback calculation for expected move if straddle is None but we have IV
+            if expected_move is None and iv30 is not None:
+                # Use 30-day IV to estimate the expected move
+                # Expected move ≈ Stock Price * IV * sqrt(time in years)
+                # For a standard 1-month expected move, use sqrt(30/365)
+                time_factor = math.sqrt(30/365)
+                estimated_straddle = underlying_price * iv30 * time_factor
+                expected_move = str(round(estimated_straddle / underlying_price * 100, 2)) + "%"
+            
             # Update progress to 100%
             if progress_callback:
                 progress_callback(100)
@@ -708,17 +949,30 @@ class AsyncApp:
                 'iv30_raw': iv30,
                 'rv30_raw': rv30,
                 'ts_slope_0_45_raw': ts_slope_0_45,
-                'current_price': underlying_price
+                'current_price': underlying_price,
+                'avg_vega': straddle_vega
             }
         except Exception as e:
-            result = {'error': f"Error occurred: {str(e)}"}
+            result = {
+                'error': f"Error occurred: {str(e)}",
+                'avg_vega': None
+            }
         
         return result
     
     async def analyze_stocks_batch(self, symbols, max_concurrent=5, status_callbacks=None, progress_callbacks=None):
         """Process multiple stocks concurrently with a limit on concurrency"""
         if not self.ib or not self.ib.isConnected():
-            return [{'ticker': symbol, 'error': 'Not connected to IB'} for symbol in symbols]
+            return [{
+                'ticker': symbol, 
+                'error': 'Not connected to IB',
+                'avg_volume_raw': None,
+                'iv30_rv30_raw': None,
+                'ts_slope_0_45_raw': None,
+                'expected_move': None,
+                'current_price': None,
+                'avg_vega': None
+            } for symbol in symbols]
         
         results = []
         
@@ -749,7 +1003,8 @@ class AsyncApp:
                         'iv30_rv30_raw': None,
                         'ts_slope_0_45_raw': None,
                         'expected_move': None,
-                        'current_price': None
+                        'current_price': None,
+                        'avg_vega': None
                     })
                 elif 'error' in result:
                     results.append({
@@ -759,7 +1014,8 @@ class AsyncApp:
                         'iv30_rv30_raw': None,
                         'ts_slope_0_45_raw': None,
                         'expected_move': None,
-                        'current_price': None
+                        'current_price': None,
+                        'avg_vega': None
                     })
                 else:
                     # Include raw metrics and booleans without status categorization
@@ -772,7 +1028,8 @@ class AsyncApp:
                         'iv30_rv30_raw': result['iv30_rv30_raw'],
                         'ts_slope_0_45_raw': result['ts_slope_0_45_raw'],
                         'expected_move': result['expected_move'],
-                        'current_price': result['current_price']
+                        'current_price': result['current_price'],
+                        'avg_vega': result['avg_vega']
                     })
         
         return results
@@ -803,6 +1060,10 @@ def main_gui():
     loop_thread = threading.Thread(target=run_event_loop, daemon=True)
     loop_thread.start()
     
+    # Log the application startup
+    logger.info("Application started")
+    logger.info(f"System: {platform.system()} {platform.release()}")
+    
     # Connection settings layout with Bloomberg-like theme
     connection_layout = [
         [styles.bold_label("IB Connection Settings")],
@@ -810,32 +1071,74 @@ def main_gui():
         [styles.label_text("Port:"), styles.input_field("7497", key="port"), 
          sg.Text("(TWS=7497, Gateway=4001)", font=styles.SMALL_FONT)],
         [styles.label_text("Client ID:"), styles.input_field("1", key="client_id")],
+        [sg.Checkbox("Debug Mode", key="debug_mode", enable_events=True, 
+                    background_color=styles.BLACK, text_color=styles.LIGHT_BLUE)],
         [styles.primary_button("Connect")],
-        [styles.status_text((40, 1), key="connection_status")]
+        [styles.status_text((80, 2), key="connection_status")],  # Increased width and height for status
     ]
     
-    connection_window = sg.Window("IB Connection", connection_layout, **styles.window_params())
+    # Increase the window width to accommodate longer error messages
+    connection_window = sg.Window("IB Connection", connection_layout, size=(600, 250), **styles.window_params())
+    
+    # Show log file location on startup
+    connection_window["connection_status"].update(
+        f"Log file location: {log_file}",
+        text_color=styles.LIGHT_BLUE
+    )
     
     while True:
         event, values = connection_window.read()
         if event in (sg.WINDOW_CLOSED, "Exit"):
+            logger.info("Connection window closed")
             app.shutdown()
             break
+        
+        if event == "debug_mode":
+            debug_enabled = values.get("debug_mode", False)
+            set_debug_mode(debug_enabled)
+            connection_window["connection_status"].update(
+                f"Debug mode {('enabled' if debug_enabled else 'disabled')} - Logs saved to {log_file}", 
+                text_color=styles.LIGHT_BLUE
+            )
         
         if event == "Connect":
             host = values.get("host", "127.0.0.1")
             port = int(values.get("port", 7497))
             client_id = int(values.get("client_id", 1))
             
+            logger.info(f"Connect button pressed - Host: {host}, Port: {port}, Client ID: {client_id}")
+            connection_window["connection_status"].update("Connecting to IB...", text_color=styles.AMBER)
+            connection_window.refresh()
+            
             try:
                 connected = app.run_async(app.init_connection(host, port, client_id))
                 if connected:
+                    logger.info("Connection successful")
                     connection_window["connection_status"].update("Connected to IB", text_color=styles.GREEN)
                     break
                 else:
-                    connection_window["connection_status"].update("Failed to connect", text_color=styles.RED)
+                    logger.error("Connection failed - IB returned not connected")
+                    mac_tip = ""
+                    if platform.system() == "Darwin":  # macOS specific help
+                        mac_tip = "\nOn Mac: Check TWS/Gateway settings > API > Enable ActiveX and Socket Clients"
+                    
+                    connection_window["connection_status"].update(
+                        f"Failed to connect - Check TWS/Gateway is running and accepting connections{mac_tip}", 
+                        text_color=styles.RED
+                    )
             except Exception as e:
-                connection_window["connection_status"].update(f"Connection failed: {str(e)}", text_color=styles.RED)
+                error_msg = str(e)
+                logger.error(f"Connection exception: {error_msg}")
+                
+                # Add Mac-specific troubleshooting tip
+                mac_tip = ""
+                if platform.system() == "Darwin":  # macOS specific help
+                    mac_tip = "\nOn Mac: Check TWS/Gateway settings > API > Enable ActiveX and Socket Clients"
+                
+                connection_window["connection_status"].update(
+                    f"Connection failed: {error_msg}{mac_tip}\nSee log file for details: {log_file}", 
+                    text_color=styles.RED
+                )
     
     if app.ib and app.ib.isConnected():
         connection_window.close()
@@ -965,20 +1268,38 @@ def main_gui():
                     window["status"].update("Operation cancelled", text_color=styles.RED)
                     continue
                 
-                # Automatically save to output.csv
+                # Save to output.csv
                 if results:
                     try:
                         df = pd.DataFrame(results)
                         output_file = 'output.csv'
                         df.to_csv(output_file, index=False)
                         window["status"].update(f"Results saved to {output_file}", text_color=styles.GREEN)
+                        
+                        # Print results to command line for easy copying
+                        print("\n===== ANALYSIS RESULTS =====")
+                        print("Ticker | Price | Volume (30d) | IV/RV Ratio | Term Structure | Expected Move | Avg Vega")
+                        print("-" * 100)
+                        for result in results:
+                            ticker = result['ticker']
+                            if 'error' in result:
+                                print(f"{ticker} | Error | Error | Error | Error | Error | Error")
+                            else:
+                                price = f"${result.get('current_price', 0):.2f}" if result.get('current_price') else 'N/A'
+                                volume = f"{result.get('avg_volume_raw', 0):,.0f}" if result.get('avg_volume_raw') else 'N/A'
+                                iv_rv = f"{result.get('iv30_rv30_raw', 0):.2f}" if result.get('iv30_rv30_raw') else 'N/A'
+                                ts_slope = f"{result.get('ts_slope_0_45_raw', 0):.6f}" if result.get('ts_slope_0_45_raw') else 'N/A'
+                                exp_move = result.get('expected_move', 'N/A')
+                                vega = f"{result.get('avg_vega', 0):.2f}" if result.get('avg_vega') is not None else 'N/A'
+                                print(f"{ticker} | {price} | {volume} | {iv_rv} | {ts_slope} | {exp_move} | {vega}")
+                        print("===== END OF RESULTS =====\n")
                     except Exception as e:
                         window["status"].update(f"Error saving file: {str(e)}", text_color=styles.RED)
                 
                 # Display results if option selected
                 if results:
                     # Create a table display with Bloomberg-like colors
-                    table_headers = ['Ticker', 'Price', 'Volume (30d)', 'IV/RV Ratio', 'Term Structure', 'Expected Move']
+                    table_headers = ['Ticker', 'Price', 'Volume (30d)', 'IV/RV Ratio', 'Term Structure', 'Expected Move', 'Avg Vega']
                     table_data = []
                     
                     for result in results:
@@ -989,16 +1310,18 @@ def main_gui():
                                 'Error',
                                 'Error',
                                 'Error',
+                                'Error',
                                 'Error'
                             ]
                         else:
                             row = [
                                 result['ticker'],
-                                f"${result['current_price']:.2f}" if result['current_price'] else 'N/A',
-                                f"{result['avg_volume_raw']:,.0f}" if result['avg_volume_raw'] else 'N/A',
-                                f"{result['iv30_rv30_raw']:.2f}" if result['iv30_rv30_raw'] else 'N/A',
-                                f"{result['ts_slope_0_45_raw']:.6f}" if result['ts_slope_0_45_raw'] else 'N/A',
-                                result['expected_move'] if result['expected_move'] else 'N/A'
+                                f"${result.get('current_price', None):.2f}" if result.get('current_price') else 'N/A',
+                                f"{result.get('avg_volume_raw', None):,.0f}" if result.get('avg_volume_raw') else 'N/A',
+                                f"{result.get('iv30_rv30_raw', None):.2f}" if result.get('iv30_rv30_raw') else 'N/A',
+                                f"{result.get('ts_slope_0_45_raw', None):.6f}" if result.get('ts_slope_0_45_raw') else 'N/A',
+                                result.get('expected_move', 'N/A'),
+                                f"{result.get('avg_vega', None):.2f}" if result.get('avg_vega') is not None else 'N/A'
                             ]
                         table_data.append(row)
                     
@@ -1011,7 +1334,7 @@ def main_gui():
                                 table_headers, 
                                 min(25, len(results))
                             ),
-                            col_widths=[10, 10, 15, 12, 15, 15],
+                            col_widths=[10, 10, 15, 10, 12, 12, 10],
                             key='-TABLE-',
                             enable_events=True,
                             enable_click_events=True  # Enable clicking on header to sort
@@ -1020,7 +1343,7 @@ def main_gui():
                     ]
                     
                     results_window = sg.Window("Results", results_layout, resizable=True, 
-                                             size=(800, 600), **styles.window_params())
+                                             size=(900, 600), **styles.window_params())
                     
                     # This will be used to track the sort state and direction
                     sort_col_idx = 0  # Default sort by first column (Ticker)
