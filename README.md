@@ -47,6 +47,7 @@ python ib_calculator.py
    - Host: 127.0.0.1 (default for local connections)
    - Port: 7497 (for TWS) or 4001 (for Gateway)
    - Client ID: Any unique number (default: 1)
+   - **Debug Mode**: Toggle on for detailed logging (helpful for troubleshooting)
    - Click "Connect"
 2. After connecting:
    - Enter stock symbols separated by commas (e.g., "AAPL, MSFT, GOOGL")
@@ -61,10 +62,21 @@ python ib_calculator.py
 - **IV/RV Ratio**: Implied volatility to realized volatility ratio
 - **Term Structure**: Slope of the volatility term structure
 - **Expected Move**: Expected price movement based on options pricing
-## Troubleshooting
-- Ensure TWS/Gateway is running and logged in
-- Verify API connections are enabled in TWS/Gateway
-- Check that the port numbers match your TWS/Gateway configuration
-- Confirm you have the required Python packages installed
+- **Avg Vega**: Average option vega (sensitivity to volatility changes)
+## Logging and Troubleshooting
+The application now provides comprehensive logging:
+- Log files are automatically created in the `logs` directory
+- Each session creates a timestamped log file
+- The log file location is displayed in the connection window
+- Enable Debug Mode for more detailed logging information
+### Common Connection Issues
+1. **TWS/Gateway not running**: Ensure the application is running and logged in
+2. **API connections not enabled**: Verify API settings in TWS/Gateway
+3. **Port accessibility**: Make sure the port isn't blocked by firewall
+### Reading Logs
+If you encounter connection problems:
+1. Enable Debug Mode before attempting to connect
+2. Check the generated log file for detailed error information
+3. Look for specific error messages about port accessibility or connection timeout
 ## Disclaimer
 This tool is for educational purposes only. It's not financial advice, and the developers accept no responsibility for investment decisions or losses. 

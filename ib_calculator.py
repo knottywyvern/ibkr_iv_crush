@@ -490,18 +490,56 @@ async def get_options_chain(ib, symbol, expiry_date, underlying_price):
                 years_to_expiry = days_to_expiry / 365.0
                 
                 # Get ATM IV
-                atm_iv = (call_iv + put_iv) / 2.0 if call_iv is not None and put_iv is not None else 0.3  # Default to 30% if IV not available
+                atm_iv = (call_iv + put_iv) / 2.0 if call_iv is not None and put_iv is not None else None  # Return None instead of default 0.3
                 
                 # Approximate vega using Black-Scholes formula for ATM options
                 # Vega ≈ S * sqrt(T) * phi(0) / 100
                 # where phi(0) is the standard normal PDF at 0, which is approximately 0.4
-                if call_vega is None and years_to_expiry > 0:
+                if call_vega is None and years_to_expiry > 0 and atm_iv is not None:
                     call_vega = underlying_price * math.sqrt(years_to_expiry) * 0.4 * atm_iv
                 
-                if put_vega is None and years_to_expiry > 0:
+                if put_vega is None and years_to_expiry > 0 and atm_iv is not None:
                     put_vega = underlying_price * math.sqrt(years_to_expiry) * 0.4 * atm_iv
+                
+                # Special case for 0 DTE - estimate vega from price instead when it's very close to expiration
+                if (call_vega is None or put_vega is None) and days_to_expiry <= 1:
+                    logger.debug(f"Using alternative Vega estimation for near-expiry options ({days_to_expiry} DTE)")
+                    
+                    # For near-expiry options, we can estimate vega using a small IV change simulation
+                    # This assumes a small artificial IV change and observes the theoretical price impact
+                    if atm_iv is None and call_price is not None and put_price is not None:
+                        # Rough IV estimate using price and simple model for very short-dated options
+                        # We're using the straddle price as approximation of expected move
+                        straddle_price = call_price + put_price
+                        # For extremely short-dated options, IV can be approximated as:
+                        # IV ≈ straddle_price / underlying_price / sqrt(1/365)
+                        one_day_factor = math.sqrt(1/365.0)
+                        atm_iv = (straddle_price / underlying_price) / one_day_factor
+                    
+                    # Use a small IV change to estimate vega if we have IV
+                    if atm_iv is not None:
+                        # For 0 DTE, use a small time factor instead of 0
+                        min_time_factor = 1/365.0  # 1 day as fraction of year
+                        
+                        # Calculate approximate vega for 0-1 DTE
+                        # Scale by time remaining in day (use at least 1 hour of time value)
+                        hours_remaining = max(4, 24 - datetime.now().hour)
+                        day_fraction = hours_remaining / 24.0
+                        time_factor = min_time_factor * day_fraction
+                        
+                        # Calculate vega for short-dated options (smaller than normal but not zero)
+                        small_vega = underlying_price * math.sqrt(time_factor) * 0.2 * atm_iv  # Use 0.2 factor for short-dated
+                        
+                        if call_vega is None:
+                            call_vega = small_vega
+                        
+                        if put_vega is None:
+                            put_vega = small_vega
+                        
+                        logger.debug(f"Estimated Vega for {expiry_date} ({days_to_expiry} DTE): {small_vega}")
         except Exception as e:
-            print(f"Error calculating Greeks: {str(e)}")
+            logger.error(f"Error calculating Greeks: {str(e)}")
+            logger.exception("Details:")
         
         # If direct IV isn't available, calculate from straddle price
         if (call_iv is None or put_iv is None) and call_price is not None and put_price is not None:
@@ -518,9 +556,6 @@ async def get_options_chain(ib, symbol, expiry_date, underlying_price):
                 # The straddle price divided by the stock price approximates one standard deviation move
                 # IV ≈ (Straddle Price / Stock Price) / sqrt(time to expiry in years)
                 straddle_iv = (straddle_price / underlying_price) / math.sqrt(years_to_expiry)
-                
-                # Apply reasonable bounds to the IV
-                straddle_iv = min(max(straddle_iv, 0.01), 2.0)  # Clamp between 1% and 200%
                 
                 if call_iv is None:
                     call_iv = straddle_iv
@@ -599,6 +634,7 @@ async def compute_recommendation(ib, ticker):
                 put_iv = puts.loc[0, 'impliedVolatility']
                 
                 if call_iv is None or put_iv is None:
+                    logger.warning(f"Missing IV data for {ticker} at expiry {exp_date}")
                     continue
                 
                 atm_iv_value = (call_iv + put_iv) / 2.0
@@ -646,18 +682,50 @@ async def compute_recommendation(ib, ticker):
         ts_slope_0_45 = (term_spline(45) - term_spline(dtes[0])) / (45-dtes[0])
         
         price_history = await get_historical_data(ib, ticker)
-        iv30_rv30 = term_spline(30) / yang_zhang(price_history)
+        
+        # Calculate RV and handle potential errors
+        rv30 = yang_zhang(price_history)
+        if rv30 <= 0 or math.isnan(rv30):
+            return {
+                'error': "Invalid realized volatility calculation (zero or negative value)",
+                'avg_vega': None
+            }
+            
+        iv30 = term_spline(30)
+        if iv30 <= 0 or math.isnan(iv30):
+            return {
+                'error': "Invalid implied volatility calculation (zero or negative value)",
+                'avg_vega': None
+            }
+            
+        iv30_rv30_ratio = iv30 / rv30
+        expected_move = str(round(straddle / underlying_price * 100, 2)) + "%" if straddle else None
+        
+        # Fallback calculation for expected move if straddle is None but we have IV
+        if expected_move is None and iv30 is not None:
+            # Use 30-day IV to estimate the expected move
+            # Expected move ≈ Stock Price * IV * sqrt(time in years)
+            # For a standard 1-month expected move, use sqrt(30/365)
+            time_factor = math.sqrt(30/365)
+            estimated_straddle = underlying_price * iv30 * time_factor
+            expected_move = str(round(estimated_straddle / underlying_price * 100, 2)) + "%"
         
         # Get average volume from Yahoo Finance instead of IB
         avg_volume = await get_average_volume(ticker)
         
-        expected_move = str(round(straddle / underlying_price * 100, 2)) + "%" if straddle else None
-        
         return {
             'avg_volume': avg_volume >= 1500000, 
-            'iv30_rv30': iv30_rv30 >= 1.25, 
+            'iv30_rv30': iv30_rv30_ratio >= 1.25, 
             'ts_slope_0_45': ts_slope_0_45 <= -0.00406, 
-            'expected_move': expected_move
+            'expected_move': expected_move,
+            # Raw values
+            'avg_volume_raw': avg_volume,
+            'iv30_rv30_raw': iv30_rv30_ratio,
+            'iv30_raw': iv30,
+            'rv30_raw': rv30,
+            'ts_slope_0_45_raw': ts_slope_0_45,
+            'current_price': underlying_price,
+            'avg_vega': None
         }
     except Exception as e:
         raise Exception(f'Error occurred processing: {str(e)}')
@@ -918,8 +986,20 @@ class AsyncApp:
             
             # Calculate raw values
             rv30 = yang_zhang(price_history)
+            if rv30 <= 0 or math.isnan(rv30):
+                return {
+                    'error': "Invalid realized volatility calculation (zero or negative value)",
+                    'avg_vega': None
+                }
+                
             iv30 = term_spline(30)
-            iv30_rv30_ratio = iv30 / rv30 if rv30 > 0 else 0
+            if iv30 <= 0 or math.isnan(iv30):
+                return {
+                    'error': "Invalid implied volatility calculation (zero or negative value)",
+                    'avg_vega': None
+                }
+                
+            iv30_rv30_ratio = iv30 / rv30
             expected_move = str(round(straddle / underlying_price * 100, 2)) + "%" if straddle else None
             
             # Fallback calculation for expected move if straddle is None but we have IV
